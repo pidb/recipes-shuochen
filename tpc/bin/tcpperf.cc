@@ -12,7 +12,24 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#ifndef __STDC_FORMAT_MACROS
+#define __STDC_FORMAT_MACROS
+#endif
+
+#include <inttypes.h>
+
+#include <thread>
+
 using muduo::Timestamp;
+
+static struct tcp_info getTcpInfo(int fd)
+{
+  struct tcp_info tcpi = {0};
+  socklen_t len = sizeof(tcpi);
+  if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &tcpi, &len) < 0)
+    perror("getsockopt(TCP_INFO)");
+  return tcpi;
+}
 
 class BandwidthReporter
 {
@@ -29,19 +46,121 @@ class BandwidthReporter
     last_bytes_ = total_bytes;
   }
 
-  void reportAll(double now, int64_t total_bytes, int64_t syscalls)
+  void reportEnd(double now, int64_t total_bytes, const char* role)
   {
-    printf("Transferred %.3fMB %.3fMiB in %.3fs, %lld syscalls, %.1f Bytes/syscall\n",
-           total_bytes / 1e6, total_bytes / (1024.0 * 1024), now, (long long)syscalls,
-           total_bytes * 1.0 / syscalls);
-    report(now, total_bytes, now);
+    printf("%s %sBytes in %.3fs, throughput: ",
+           role, formatSI(total_bytes).c_str(), now);
+    double bps = total_bytes / now;
+    printf("%sBytes/s, ", formatSI(bps).c_str());
+    printf("%sbits/s\n", formatSI(bps * 8).c_str());
+  }
+
+  void reportSender(const struct tcp_info& tcpi)
+  {
+    printf("rto %s, ", formatMicrosecond(tcpi.tcpi_rto).c_str());
+#ifdef __linux
+    printf("min_rtt %s, ", formatMicrosecond(tcpi.tcpi_min_rtt).c_str());
+    printf("data_segs_out %d, ", tcpi.tcpi_data_segs_out);
+    printf("total_retrans %d, ", tcpi.tcpi_total_retrans);
+    printf("bytes_retrans %lld, ", tcpi.tcpi_bytes_retrans);
+    printf("reord_seen %d\n", tcpi.tcpi_reord_seen);
+    printf("busy_time %s, ", formatMicrosecond(tcpi.tcpi_busy_time).c_str());
+    printf("rwnd_limited %s, ", formatMicrosecond(tcpi.tcpi_rwnd_limited).c_str());
+    printf("sndbuf_limited %s, ", formatMicrosecond(tcpi.tcpi_sndbuf_limited).c_str());
+#elif __FreeBSD__
+    printf("total_retrans %d", tcpi.tcpi_snd_rexmitpack);
+#endif
+    printf("\n");
   }
 
  private:
+
+  static std::string formatSI(double bps)
+  {
+    char buf[64];
+
+    if (bps <= 9990)
+      snprintf(buf, sizeof buf, "%.2fk", bps/1e3);
+    else if (bps <= 99.9e3)
+      snprintf(buf, sizeof buf, "%.1fk", bps/1e3);
+    else if (bps <= 9999e3)
+      snprintf(buf, sizeof buf, "%.0fk", bps/1e3);
+
+    else if (bps <= 99.9e6)
+      snprintf(buf, sizeof buf, "%.1fM", bps/1e6);
+    else if (bps <= 9999e6)
+      snprintf(buf, sizeof buf, "%.0fM", bps/1e6);
+
+    else if (bps <= 99.9e9)
+      snprintf(buf, sizeof buf, "%.1fG", bps/1e9);
+    else if (bps <= 9999e9)
+      snprintf(buf, sizeof buf, "%.0fG", bps/1e9);
+    else
+      snprintf(buf, sizeof buf, "%gT", bps/1e12);
+
+    return buf;
+  }
+
+  static std::string formatIEC(int64_t s)
+  {
+    double n = static_cast<double>(s);
+    char buf[64];
+    const double Ki = 1024.0;
+    const double Mi = Ki * 1024.0;
+    const double Gi = Mi * 1024.0;
+
+    if (n < 10000)
+      snprintf(buf, sizeof buf, "%" PRId64, s);
+    else if (n <= Ki*9.99)
+      snprintf(buf, sizeof buf, "%.2fKi", n / Ki);
+    else if (n <= Ki*99.9)
+      snprintf(buf, sizeof buf, "%.1fKi", n / Ki);
+    else if (n <= Ki*9999.0)
+      snprintf(buf, sizeof buf, "%.0fKi", n / Ki);
+
+    else if (n <= Mi*9.99)
+      snprintf(buf, sizeof buf, "%.2fMi", n / Mi);
+    else if (n <= Mi*99.9)
+      snprintf(buf, sizeof buf, "%.1fMi", n / Mi);
+    else if (n <= Mi*9999.0)
+      snprintf(buf, sizeof buf, "%.0fMi", n / Mi);
+
+    else if (n <= Gi*9.99)
+      snprintf(buf, sizeof buf, "%.2fGi", n / Gi);
+    else if (n <= Gi*99.9)
+      snprintf(buf, sizeof buf, "%.1fGi", n / Gi);
+    else if (n <= Gi*9999.0)
+      snprintf(buf, sizeof buf, "%.0fGi", n / Gi);
+    else
+      snprintf(buf, sizeof buf, "%gGi", n / Gi);
+
+    return buf;
+  }
+
+  static std::string formatMicrosecond(int us, bool show_us = true)
+  {
+    char buf[64];
+    if (us < 1000)
+      snprintf(buf, sizeof buf, "%d%s", us, show_us ? "us" : "");
+    else if (us < 10000)
+      snprintf(buf, sizeof buf, "%.2fms", us / 1e3);
+    else if (us < 100000)
+      snprintf(buf, sizeof buf, "%.1fms", us / 1e3);
+    else if (us < 1000000)
+      snprintf(buf, sizeof buf, "%.0fms", us / 1e3);
+    else
+      snprintf(buf, sizeof buf, "%.2fs", us / 1e6);
+
+    return buf;
+  }
+
   void report(double now, int64_t bytes, double elapsed)
   {
-    double mbps = elapsed > 0 ? bytes / 1e6 / elapsed : 0.0;
-    printf("%6.3f  %6.2fMB/s  %6.1fMbits/s ", now, mbps, mbps*8);
+    double bps = elapsed > 0 ? bytes / elapsed : 0.0;
+
+    printf("%7.3fs  ", now);
+    printf("%7sB  ", formatIEC(bytes).c_str());
+    printf("%5sbps  ", formatSI(bps * 8).c_str());
     if (sender_)
       printSender();
     else
@@ -55,13 +174,8 @@ class BandwidthReporter
     if (::getsockopt(fd_, SOL_SOCKET, SO_SNDBUF, &sndbuf, &optlen) < 0)
       perror("getsockopt(SNDBUF)");
 
-    struct tcp_info tcpi = {0};
-    socklen_t len = sizeof(tcpi);
-    if (getsockopt(fd_, IPPROTO_TCP, TCP_INFO, &tcpi, &len) < 0)
-      perror("getsockopt(TCP_INFO)");
+    struct tcp_info tcpi = getTcpInfo(fd_);
 
-    // bytes_in_flight = tcpi.tcpi_bytes_sent - tcpi.tcpi_bytes_acked;
-    // tcpi.tcpi_notsent_bytes;
     int snd_cwnd = tcpi.tcpi_snd_cwnd;
     int ssthresh = tcpi.tcpi_snd_ssthresh;
 #ifdef __linux
@@ -72,18 +186,33 @@ class BandwidthReporter
 
 #ifdef __linux
     int retrans = tcpi.tcpi_total_retrans;
+    // int ca_state = tcpi.tcpi_ca_state;
+    int64_t pacing = tcpi.tcpi_pacing_rate;
+    //int64_t delivery = tcpi.tcpi_delivery_rate;
+    int bytes_in_flight = tcpi.tcpi_bytes_sent - tcpi.tcpi_bytes_acked - tcpi.tcpi_bytes_retrans + 1;  // SYN
+    // tcpi.tcpi_notsent_bytes;
 #elif __FreeBSD__
     int retrans = tcpi.tcpi_snd_rexmitpack;
+    // int ca_state = tcpi.__tcpi_ca_state;
+    int64_t pacing = 0;
+    //int64_t delivery = 0;
+    int bytes_in_flight = 0;
 #endif
-
-    printf(" sndbuf=%.1fK snd_cwnd=%.1fK ssthresh=%.1fK snd_wnd=%.1fK rtt=%d/%d",
-           sndbuf / 1024.0, snd_cwnd / 1024.0, ssthresh / 1024.0,
-           tcpi.tcpi_snd_wnd / 1024.0, tcpi.tcpi_rtt, tcpi.tcpi_rttvar);
-    if (retrans - last_retrans_ > 0) {
-      printf(" retrans=%d", retrans - last_retrans_);
-    }
-    printf("\n");
+    int retr = retrans - last_retrans_;
     last_retrans_ = retrans;
+
+    printf("%6s  ", formatSI(pacing).c_str());
+    printf("%6sB ", formatIEC(bytes_in_flight).c_str());
+    printf("%6s  ", formatIEC(snd_cwnd).c_str());
+    printf("%6s  ", formatIEC(tcpi.tcpi_snd_wnd).c_str());
+    printf("%6s  ", formatIEC(sndbuf).c_str());
+    printf("%6sB ",  formatIEC(ssthresh).c_str());
+    // printf("%2d  ", ca_state);
+    printf("%5d  ", retr);
+    printf("%s/%s", formatMicrosecond(tcpi.tcpi_rtt).c_str(),
+           formatMicrosecond(tcpi.tcpi_rttvar, false).c_str());
+
+    printf("\n");
   }
 
   void printReceiver() const
@@ -93,7 +222,16 @@ class BandwidthReporter
     if (::getsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &rcvbuf, &optlen) < 0)
       perror("getsockopt(RCVBUF)");
 
-    printf(" rcvbuf=%.1fK\n", rcvbuf / 1024.0);
+    struct tcp_info tcpi = getTcpInfo(fd_);
+
+    printf("%6s  ", formatIEC(rcvbuf).c_str());
+    printf("%9s  ", formatIEC(tcpi.tcpi_rcv_space).c_str());
+#ifdef __linux
+    printf("%11s  ", formatIEC(tcpi.tcpi_rcv_ssthresh).c_str());
+    printf("%7s ", formatMicrosecond(tcpi.tcpi_rcv_rtt).c_str());
+    printf("%7s", formatMicrosecond(tcpi.tcpi_ato).c_str());
+#endif
+    printf("\n");
   }
 
   const int fd_ = 0;
@@ -103,7 +241,8 @@ class BandwidthReporter
   int last_retrans_ = 0;
 };
 
-void runClient(const InetAddress& serverAddr, int64_t bytes_limit, double duration)
+void runClient(const InetAddress& serverAddr, int64_t bytes_limit,
+               double duration, const std::string& cong_ctrl)
 {
   TcpStreamPtr stream(TcpStream::connect(serverAddr));
   if (!stream) {
@@ -111,13 +250,26 @@ void runClient(const InetAddress& serverAddr, int64_t bytes_limit, double durati
     perror("");
     return;
   }
+
+  if (!cong_ctrl.empty()) {
+    if (::setsockopt(stream->fd(), IPPROTO_TCP, TCP_CONGESTION,
+                     cong_ctrl.data(), cong_ctrl.size()) < 0)
+      perror("setsockopt(TCP_CONGESTION)");
+  }
+
+  {
   char cong[64] = "";
   socklen_t optlen = sizeof cong;
   if (::getsockopt(stream->fd(), IPPROTO_TCP, TCP_CONGESTION, cong, &optlen) < 0)
       perror("getsockopt(TCP_CONGESTION)");
-  printf("Connected %s -> %s, congestion control: %s\n",
+
+  struct tcp_info tcpi = getTcpInfo(stream->fd());
+  printf("Connected %s -> %s, MSS %d, congestion control: %s\n",
          stream->getLocalAddr().toIpPort().c_str(),
-         stream->getPeerAddr().toIpPort().c_str(), cong);
+         stream->getPeerAddr().toIpPort().c_str(),
+         tcpi.tcpi_snd_mss, cong);
+  }
+  printf("Time (s)  Transfer   Bitrate  Pacing InFlight   Cwnd    Rwnd  sndbuf ssthresh  Retr  rtt/var\n");
 
   const Timestamp start = Timestamp::now();
   const int block_size = 64 * 1024;
@@ -148,10 +300,16 @@ void runClient(const InetAddress& serverAddr, int64_t bytes_limit, double durati
     }
   }
 
+
+  // Get TCP_INFO before shutdown.
+  // On FreeBSD, it becomes unavailable after shutdown.
+  struct tcp_info tcpi = getTcpInfo(stream->fd());
+
   stream->shutdownWrite();
   Timestamp shutdown = Timestamp::now();
   elapsed = timeDifference(shutdown, start);
   rpt.reportDelta(elapsed, total_bytes);
+  rpt.reportEnd(elapsed, total_bytes, "Tx");
 
   char buf[1024];
   int nr = stream->receiveSome(buf, sizeof buf);
@@ -159,48 +317,66 @@ void runClient(const InetAddress& serverAddr, int64_t bytes_limit, double durati
     printf("nr = %d\n", nr);
   Timestamp end = Timestamp::now();
   elapsed = timeDifference(end, start);
-  rpt.reportAll(elapsed, total_bytes, syscalls);
+  rpt.reportEnd(elapsed, total_bytes, "Rx");
+  rpt.reportSender(tcpi);
 }
 
-void runServer(int port)
+void serverThr(int id, TcpStreamPtr stream)
 {
-  InetAddress listenAddr(port);
+#ifdef __linux
+  printf("Time (s)  Transfer   Bitrate  rcvbuf  rcv_space rcv_ssthresh  rcv_rtt     ato\n");
+#elif __FreeBSD__
+  printf("Time (s)  Transfer   Bitrate  rcvbuf  rcv_space\n");
+#endif
+
+  const Timestamp start = Timestamp::now();
+  int seconds = 1;
+  int64_t bytes = 0;
+  int64_t syscalls = 0;
+  double elapsed = 0;
+  BandwidthReporter rpt(stream->fd(), false);
+  rpt.reportDelta(elapsed, bytes);
+
+  char buf[65536];
+  while (true) {
+    int nr = stream->receiveSome(buf, sizeof buf);
+    if (nr <= 0)
+      break;
+    bytes += nr;
+    syscalls++;
+
+    elapsed = timeDifference(Timestamp::now(), start);
+    if (elapsed >= seconds) {
+      rpt.reportDelta(elapsed, bytes);
+      while (elapsed >= seconds)
+        ++seconds;
+    }
+  }
+  elapsed = timeDifference(Timestamp::now(), start);
+  rpt.reportDelta(elapsed, bytes);
+  rpt.reportEnd(elapsed, bytes, "Rx");
+  struct tcp_info tcpi = getTcpInfo(stream->fd());
+  printf("rcv_ooopack %d\n", tcpi.tcpi_rcv_ooopack);
+  printf("Client no. %d done\n", id);
+  printf("\n");
+}
+
+// a thread-per-connection discard server
+void runServer(int port, bool ipv6)
+{
+  InetAddress listenAddr(port, ipv6);
   Acceptor acceptor(listenAddr);
   int count = 0;
+  printf("Listening on port %d ... Ctrl-C to exit\n", port);
   while (true) {
-    printf("Accepting on port %d ... Ctrl-C to exit\n", port);
     TcpStreamPtr stream = acceptor.accept();
     ++count;
-    printf("accepted no. %d client %s <- %s\n", count,
+    printf("Accepted no. %d client %s <- %s\n", count,
            stream->getLocalAddr().toIpPort().c_str(),
            stream->getPeerAddr().toIpPort().c_str());
 
-    const Timestamp start = Timestamp::now();
-    int seconds = 1;
-    int64_t bytes = 0;
-    int64_t syscalls = 0;
-    double elapsed = 0;
-    BandwidthReporter rpt(stream->fd(), false);
-    rpt.reportDelta(elapsed, bytes);
-
-    char buf[65536];
-    while (true) {
-      int nr = stream->receiveSome(buf, sizeof buf);
-      if (nr <= 0)
-        break;
-      bytes += nr;
-      syscalls++;
-
-      elapsed = timeDifference(Timestamp::now(), start);
-      if (elapsed >= seconds) {
-        rpt.reportDelta(elapsed, bytes);
-        while (elapsed >= seconds)
-          ++seconds;
-      }
-    }
-    elapsed = timeDifference(Timestamp::now(), start);
-    rpt.reportAll(elapsed, bytes, syscalls);
-    printf("Client no. %d done\n", count);
+    std::thread thr(serverThr, count, std::move(stream));
+    thr.detach();
   }
 }
 
@@ -228,20 +404,30 @@ int64_t parseBytes(const char* arg)
   }
 }
 
+void help(const char* program)
+{
+  printf("Usage: %s [-s [-6]|-c Server_IP] [-t sec] [-b bytes] [-p port] [-C congestion_control]\n", program);
+}
+
 int main(int argc, char* argv[])
 {
   int opt;
   bool client = false, server = false;
-  std::string serverAddr;
+  std::string serverAddr, cong_ctrl;
   int port = 2009;
+  bool ipv6 = false;
   const int64_t kGigaBytes = 1024 * 1024 * 1024;
   int64_t bytes_limit = 10 * kGigaBytes;
   double duration = 10;
 
-  while ((opt = getopt(argc, argv, "sc:t:b:p:")) != -1) {
+  // TODO: set congestion control
+  while ((opt = getopt(argc, argv, "s6c:t:b:p:C:")) != -1) {
     switch (opt) {
       case 's':
         server = true;
+        break;
+      case '6':
+        ipv6 = true;
         break;
       case 'c':
         client = true;
@@ -256,14 +442,21 @@ int main(int argc, char* argv[])
       case 'p':
         port = strtol(optarg, NULL, 10);
         break;
+      case 'C':
+        cong_ctrl = optarg;
+        break;
       default:
-        fprintf(stderr, "Usage: %s FIXME\n", argv[0]);
+        help(argv[0]);
+        return 1;
         break;
     }
   }
 
+  // TODO: resolve host name
   if (client)
-    runClient(InetAddress(serverAddr, port), bytes_limit, duration);
+    runClient(InetAddress(serverAddr, port), bytes_limit, duration, cong_ctrl);
   else if (server)
-    runServer(port);
+    runServer(port, ipv6);
+  else
+    help(argv[0]);
 }
